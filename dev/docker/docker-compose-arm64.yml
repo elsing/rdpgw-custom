@@ -39,8 +39,10 @@ services:
   rdpgw:
     container_name: rdpgw
     hostname: rdpgw
-    image: bolkedebruin/rdpgw:latest
-    build: .
+    image: rdpgw-custom:latest
+    build:
+      context: ../..
+      dockerfile: dev/docker/Dockerfile
     ports:
       - 9443:9443
     restart: on-failure

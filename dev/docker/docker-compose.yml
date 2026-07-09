@@ -42,7 +42,9 @@ services:
       environment:
         TZ: "Europe/Amsterdam"
   rdpgw:
-       build: .
+       build:
+         context: ../..
+         dockerfile: dev/docker/Dockerfile
        ports:
          - 9443:9443
        restart: on-failure
