@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"strconv"
+	"time"
 
 	"github.com/bolkedebruin/gokrb5/v8/keytab"
 	"github.com/bolkedebruin/gokrb5/v8/service"
@@ -86,6 +87,12 @@ func main() {
 
 	// set security options
 	security.VerifyClientIP = conf.Security.VerifyClientIp
+	if conf.Security.PAATokenLifetime > 0 {
+		security.ExpiryTime = time.Duration(conf.Security.PAATokenLifetime) * time.Minute
+	}
+	if conf.Security.PAAReconnectWindow > 0 {
+		security.ReconnectWindow = time.Duration(conf.Security.PAAReconnectWindow) * time.Minute
+	}
 	security.SigningKey = []byte(conf.Security.PAATokenSigningKey)
 	security.EncryptionKey = []byte(conf.Security.PAATokenEncryptionKey)
 	security.UserEncryptionKey = []byte(conf.Security.UserTokenEncryptionKey)
@@ -203,6 +210,7 @@ func main() {
 	if conf.Caps.TokenAuth {
 		gw.CheckPAACookie = security.CheckPAACookie
 		gw.CheckHost = security.CheckSession(security.CheckHost)
+		protocol.OnTunnelClosed = security.RecordTunnelClosed
 	} else {
 		gw.CheckHost = security.CheckHost
 	}

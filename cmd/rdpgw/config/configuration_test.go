@@ -132,6 +132,51 @@ func contains(haystack, needle string) bool {
 	return false
 }
 
+// TestPAAReconnectSettingsFromEnv asserts that PAATokenLifetime and
+// PAAReconnectWindow can be set via the standard RDPGW_<SECTION>__<FIELD>
+// environment variable convention (no config file needed), the same way
+// every other Configuration field already can - RDPGW_SECURITY__PAATOKENLIFETIME
+// and RDPGW_SECURITY__PAARECONNECTWINDOW respectively.
+func TestPAAReconnectSettingsFromEnv(t *testing.T) {
+	t.Setenv("RDPGW_SECURITY__PAATOKENLIFETIME", "15")
+	t.Setenv("RDPGW_SECURITY__PAARECONNECTWINDOW", "45")
+	// Load() needs signing/encryption keys of the right length or it will
+	// silently generate random ones; that's fine here, we only care about
+	// the two fields under test.
+	t.Setenv("RDPGW_SECURITY__PAATOKENSIGNINGKEY", "5aa3a1568fe8421cd7e127d5ace28d2d")
+	t.Setenv("RDPGW_SECURITY__PAATOKENENCRYPTIONKEY", "d3ecd7e565e56e37e2f2e95b584d8c0c")
+	t.Setenv("RDPGW_SERVER__SESSIONKEY", "0123456789abcdef0123456789abcdef")
+	t.Setenv("RDPGW_SERVER__SESSIONENCRYPTIONKEY", "fedcba9876543210fedcba9876543210")
+
+	c := Load("/nonexistent-rdpgw-config-for-test.yaml")
+
+	if c.Security.PAATokenLifetime != 15 {
+		t.Errorf("PAATokenLifetime = %d, want 15 (from RDPGW_SECURITY__PAATOKENLIFETIME)", c.Security.PAATokenLifetime)
+	}
+	if c.Security.PAAReconnectWindow != 45 {
+		t.Errorf("PAAReconnectWindow = %d, want 45 (from RDPGW_SECURITY__PAARECONNECTWINDOW)", c.Security.PAAReconnectWindow)
+	}
+}
+
+// TestPAAReconnectWindowDefaultsToDisabled asserts that with no env var or
+// config file entry, PAAReconnectWindow defaults to 0 (disabled) while
+// PAATokenLifetime still defaults to 5 - i.e. reconnects are opt-in.
+func TestPAAReconnectWindowDefaultsToDisabled(t *testing.T) {
+	t.Setenv("RDPGW_SECURITY__PAATOKENSIGNINGKEY", "5aa3a1568fe8421cd7e127d5ace28d2d")
+	t.Setenv("RDPGW_SECURITY__PAATOKENENCRYPTIONKEY", "d3ecd7e565e56e37e2f2e95b584d8c0c")
+	t.Setenv("RDPGW_SERVER__SESSIONKEY", "0123456789abcdef0123456789abcdef")
+	t.Setenv("RDPGW_SERVER__SESSIONENCRYPTIONKEY", "fedcba9876543210fedcba9876543210")
+
+	c := Load("/nonexistent-rdpgw-config-for-test.yaml")
+
+	if c.Security.PAAReconnectWindow != 0 {
+		t.Errorf("PAAReconnectWindow = %d, want 0 (disabled by default)", c.Security.PAAReconnectWindow)
+	}
+	if c.Security.PAATokenLifetime != 5 {
+		t.Errorf("PAATokenLifetime = %d, want 5 (default)", c.Security.PAATokenLifetime)
+	}
+}
+
 func TestHeaderConfigValidation(t *testing.T) {
 	cases := []struct {
 		name        string

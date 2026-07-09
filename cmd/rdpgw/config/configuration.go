@@ -123,13 +123,13 @@ type OpenIDConfig struct {
 }
 
 type HeaderConfig struct {
-	UserHeader      string `koanf:"userheader"`
-	UserIdHeader    string `koanf:"useridheader"`
-	EmailHeader     string `koanf:"emailheader"`
+	UserHeader        string `koanf:"userheader"`
+	UserIdHeader      string `koanf:"useridheader"`
+	EmailHeader       string `koanf:"emailheader"`
 	DisplayNameHeader string `koanf:"displaynameheader"`
 	// TrustedProxies is the CIDR allow-list of upstream proxies allowed to
 	// stamp UserHeader (and friends). Empty disables header auth at runtime.
-	TrustedProxies  []string `koanf:"trustedproxies"`
+	TrustedProxies []string `koanf:"trustedproxies"`
 }
 
 type RDGCapsConfig struct {
@@ -154,6 +154,22 @@ type SecurityConfig struct {
 	QueryTokenIssuer       string `koanf:"querytokenissuer"`
 	VerifyClientIp         bool   `koanf:"verifyclientip"`
 	EnableUserToken        bool   `koanf:"enableusertoken"`
+	// PAATokenLifetime is how long (in minutes) the PAA token embedded in
+	// the .rdp file is valid for. The client resends this token on every
+	// tunnel create, including reconnects after brief network drops, so
+	// values that are too short will cause reconnects to be rejected with
+	// E_PROXY_COOKIE_AUTHENTICATION_ACCESS_DENIED even though the session
+	// itself is still within IdleTimeout. Defaults to 5 minutes.
+	PAATokenLifetime int `koanf:"paatokenlifetime"`
+	// PAAReconnectWindow is an additional grace period (in minutes), on
+	// top of PAATokenLifetime, during which a PAA token that has ALREADY
+	// been used to open a tunnel successfully at least once may be reused
+	// past its nominal expiry - allowing a client to reconnect after a
+	// brief network interruption without a fresh .rdp file. A token that
+	// is expired and was never used successfully is still rejected
+	// outright. Zero (the default) disables this and preserves strict
+	// expiry behaviour.
+	PAAReconnectWindow int `koanf:"paareconnectwindow"`
 }
 
 type ClientConfig struct {
@@ -212,19 +228,22 @@ func Load(configFile string) Configuration {
 
 	var k = koanf.New(".")
 
-	k.Load(confmap.Provider(map[string]interface{}{
-		"Server.Tls":                 "auto",
-		"Server.Port":                443,
-		"Server.SessionStore":        "cookie",
-		"Server.HostSelection":       "roundrobin",
-		"Server.Authentication":      "openid",
-		"Server.AuthSocket":          "/tmp/rdpgw-auth.sock",
-		"Server.BasicAuthTimeout":    5,
-		"Client.NetworkAutoDetect":   1,
-		"Client.BandwidthAutoDetect": 1,
-		"Security.VerifyClientIp":    true,
-		"Caps.TokenAuth":             true,
-	}, "."), nil)
+	defaults := map[string]interface{}{
+		"Server.Tls":                  "auto",
+		"Server.Port":                 443,
+		"Server.SessionStore":         "cookie",
+		"Server.HostSelection":        "roundrobin",
+		"Server.Authentication":       "openid",
+		"Server.AuthSocket":           "/tmp/rdpgw-auth.sock",
+		"Server.BasicAuthTimeout":     5,
+		"Client.NetworkAutoDetect":    1,
+		"Client.BandwidthAutoDetect":  1,
+		"Security.VerifyClientIp":     true,
+		"Security.PAATokenLifetime":   5,
+		"Security.PAAReconnectWindow": 0,
+		"Caps.TokenAuth":              true,
+	}
+	k.Load(confmap.Provider(defaults, "."), nil)
 
 	if _, err := os.Stat(configFile); os.IsNotExist(err) {
 		log.Printf("Config file %s not found, using defaults and environment", configFile)
@@ -248,6 +267,20 @@ func Load(configFile string) Configuration {
 
 	}), nil); err != nil {
 		log.Fatalf("Error loading config from environment: %v", err)
+	}
+
+	// The env provider above camel-cases keys from their all-caps form
+	// (RDPGW_SECURITY__PAATOKENLIFETIME -> Security.Paatokenlifetime),
+	// which differs from the casing the defaults use for multi-word
+	// fields (Security.PAATokenLifetime). koanf keys are case-sensitive,
+	// so both variants end up in the store, and the case-insensitive
+	// unmarshal below would pick one of them nondeterministically. When
+	// the env-cased variant of a defaulted key exists, drop the
+	// default-cased one so the override reliably wins.
+	for key := range defaults {
+		if envKey := ToCamel(strings.ToLower(key)); envKey != key && k.Exists(envKey) {
+			k.Delete(key)
+		}
 	}
 
 	koanfTag := koanf.UnmarshalConf{Tag: "koanf"}

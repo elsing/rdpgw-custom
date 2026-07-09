@@ -252,6 +252,27 @@ Security:
   # Verifies if the ip used to connect to download the rdp file equals from where the
   # connection is opened.
   VerifyClientIp: true
+  # How long (in minutes) the PAA token embedded in the downloaded .rdp file
+  # remains valid. The RDP client resends this same token every time it opens
+  # a tunnel to the gateway, including on reconnects after a brief network
+  # interruption - not just on the initial connect. If a reconnect happens
+  # after this many minutes have passed since the file was downloaded, it
+  # will be rejected even if the session itself is still within IdleTimeout.
+  # Raise this if you see reconnects failing after short network blips.
+  # Defaults to 5. Can also be set via the RDPGW_SECURITY__PAATOKENLIFETIME
+  # environment variable.
+  PAATokenLifetime: 5
+  # Additional grace period (in minutes) on top of PAATokenLifetime.
+  # A PAA token that has ALREADY been used to open a tunnel successfully
+  # at least once may be reused past its nominal expiry within this
+  # window - letting a client reconnect after a brief network blip
+  # without a fresh .rdp file. A token that is expired and was never
+  # used successfully (e.g. a stale or stolen, but never-used, .rdp
+  # file) is still rejected outright regardless of this setting.
+  # Defaults to 0 (disabled - strict expiry, previous behaviour); set to
+  # 0 to turn reconnects back off. Can also be set via the
+  # RDPGW_SECURITY__PAARECONNECTWINDOW environment variable.
+  PAAReconnectWindow: 30
 ```
 
 ## How to build & install

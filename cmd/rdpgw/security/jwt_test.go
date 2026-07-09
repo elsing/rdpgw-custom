@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/bolkedebruin/rdpgw/cmd/rdpgw/identity"
 	"github.com/bolkedebruin/rdpgw/cmd/rdpgw/protocol"
@@ -142,6 +143,187 @@ func TestPAACookieHasAudienceClaim(t *testing.T) {
 	payload := paaPayload(t, token)
 	if !strings.Contains(payload, `"aud"`) {
 		t.Errorf("PAA cookie has no aud claim\npayload: %s", payload)
+	}
+}
+
+// newCheckCtx builds a context for CheckPAACookie the same way
+// TestCheckPAACookieIsSelfContained does: a fresh identity/tunnel pair
+// scoped to the given client IP, with VerifyClientIP left as the caller
+// set it.
+func newCheckCtx(clientIp string) (context.Context, *protocol.Tunnel) {
+	id := identity.NewUser()
+	id.SetUserName("alice")
+	id.SetAttribute(identity.AttrClientIp, clientIp)
+	ctx := context.WithValue(context.Background(), identity.CTXKey, id)
+	tun := &protocol.Tunnel{User: id}
+	ctx = context.WithValue(ctx, protocol.CtxTunnel, tun)
+	return ctx, tun
+}
+
+// closeTunnel simulates a tunnel tearing down: sets LastSeen to mark when
+// it was last genuinely active (real code does this on every Read(); tests
+// set it directly), then fires the same hook RemoveTunnel fires in the
+// real gateway.
+func closeTunnel(tun *protocol.Tunnel, lastSeen time.Time) {
+	tun.LastSeen = lastSeen
+	RecordTunnelClosed(tun)
+}
+
+// fakeClock swaps the security package's clock for one the test can advance
+// by hand. JWT exp claims have one-second resolution, so realistic expiry
+// behaviour can't be tested with sub-second ExpiryTime values and sleeps;
+// instead these tests use minute-scale durations against a fake clock.
+type fakeClock struct{ now time.Time }
+
+func (c *fakeClock) Advance(d time.Duration) { c.now = c.now.Add(d) }
+
+// setupReconnectTest points the package globals at test values and restores
+// them (and the reconnect cache, and the real clock) when the test ends, so
+// mutations don't leak into other tests in this package.
+func setupReconnectTest(t *testing.T, expiry, window time.Duration) *fakeClock {
+	t.Helper()
+	origSigning, origVerify := SigningKey, VerifyClientIP
+	origExpiry, origWindow, origNow := ExpiryTime, ReconnectWindow, timeNow
+	t.Cleanup(func() {
+		SigningKey, VerifyClientIP = origSigning, origVerify
+		ExpiryTime, ReconnectWindow, timeNow = origExpiry, origWindow, origNow
+		closedTunnelActivity.Flush()
+	})
+
+	SigningKey = []byte("5aa3a1568fe8421cd7e127d5ace28d2d")
+	VerifyClientIP = false
+	ExpiryTime = expiry
+	ReconnectWindow = window
+	closedTunnelActivity.Flush()
+
+	clock := &fakeClock{now: time.Now()}
+	timeNow = func() time.Time { return clock.now }
+	return clock
+}
+
+// TestCheckPAACookieReconnectWindowDisabledByDefault asserts the previous,
+// strict behaviour is unchanged when PAAReconnectWindow is left at its
+// zero-value default: an expired token is rejected outright, even if the
+// tunnel it authenticated was active right up until it closed.
+func TestCheckPAACookieReconnectWindowDisabledByDefault(t *testing.T) {
+	clock := setupReconnectTest(t, 5*time.Minute, 0)
+
+	issueCtx, _ := newCheckCtx("10.0.0.1")
+	token, err := GeneratePAAToken(issueCtx, "alice", "rdp.example.com")
+	if err != nil {
+		t.Fatalf("GeneratePAAToken: %v", err)
+	}
+
+	checkCtx, tun := newCheckCtx("10.0.0.1")
+	if ok, err := CheckPAACookie(checkCtx, token); err != nil || !ok {
+		t.Fatalf("first use should succeed: ok=%v err=%v", ok, err)
+	}
+	closeTunnel(tun, clock.now) // active right up to close
+
+	clock.Advance(6 * time.Minute) // past ExpiryTime
+
+	checkCtx2, _ := newCheckCtx("10.0.0.1")
+	if ok, err := CheckPAACookie(checkCtx2, token); err == nil || ok {
+		t.Fatalf("expired token should be rejected when ReconnectWindow=0: ok=%v err=%v", ok, err)
+	}
+}
+
+// TestCheckPAACookieReconnectAfterLongStableSession is the scenario this
+// feature exists for: a session that ran healthily for a long time (no
+// reconnects at all, so nothing ever touched CheckPAACookie again after
+// the first connect) blips right at the end. The reconnect window must be
+// judged against how recently the tunnel was genuinely active when it
+// closed, not against how long ago the original connect happened -
+// otherwise a long, healthy session would be *less* protected than a
+// flaky one that kept reconnecting.
+func TestCheckPAACookieReconnectAfterLongStableSession(t *testing.T) {
+	clock := setupReconnectTest(t, 5*time.Minute, 30*time.Minute)
+
+	issueCtx, _ := newCheckCtx("10.0.0.1")
+	token, err := GeneratePAAToken(issueCtx, "alice", "rdp.example.com")
+	if err != nil {
+		t.Fatalf("GeneratePAAToken: %v", err)
+	}
+
+	checkCtx, tun := newCheckCtx("10.0.0.1")
+	if ok, err := CheckPAACookie(checkCtx, token); err != nil || !ok {
+		t.Fatalf("first use should succeed: ok=%v err=%v", ok, err)
+	}
+
+	// The tunnel stays open and genuinely active for well longer than
+	// ExpiryTime, exactly as a long, stable RDP session would - nobody
+	// calls CheckPAACookie again during this stretch because no new
+	// tunnel is being created; the client is just talking to the one it
+	// already has.
+	clock.Advance(2 * time.Hour)
+
+	// The blip finally happens: the tunnel closes now, with LastSeen
+	// reflecting that it was genuinely active right up to this moment -
+	// not the original connect time from two hours ago.
+	closeTunnel(tun, clock.now)
+
+	// Reconnect arrives shortly after that true last activity - well
+	// within ReconnectWindow of it - even though it's long past
+	// ExpiryTime and long past the original connect.
+	clock.Advance(2 * time.Minute)
+	checkCtx2, tun2 := newCheckCtx("10.0.0.1")
+	ok, err := CheckPAACookie(checkCtx2, token)
+	if err != nil || !ok {
+		t.Fatalf("reconnect shortly after a long stable session should succeed: ok=%v err=%v", ok, err)
+	}
+	if tun2.User.UserName() != "alice" {
+		t.Fatalf("tunnel.User = %q, want %q", tun2.User.UserName(), "alice")
+	}
+}
+
+// TestCheckPAACookieRejectsNeverUsedExpiredToken asserts that a stale
+// token that was never successfully used before is rejected outright, even
+// with a reconnect window configured. This is the security property that
+// makes the reconnect window safe to enable: it only extends tokens that
+// have already proven themselves against a real, observed tunnel, not any
+// expired token that shows up.
+func TestCheckPAACookieRejectsNeverUsedExpiredToken(t *testing.T) {
+	clock := setupReconnectTest(t, 5*time.Minute, 30*time.Minute)
+
+	issueCtx, _ := newCheckCtx("10.0.0.1")
+	token, err := GeneratePAAToken(issueCtx, "alice", "rdp.example.com")
+	if err != nil {
+		t.Fatalf("GeneratePAAToken: %v", err)
+	}
+
+	clock.Advance(6 * time.Minute) // let it expire without ever being used
+
+	checkCtx, _ := newCheckCtx("10.0.0.1")
+	if ok, err := CheckPAACookie(checkCtx, token); err == nil || ok {
+		t.Fatalf("never-used expired token should be rejected: ok=%v err=%v", ok, err)
+	}
+}
+
+// TestCheckPAACookieRejectsAfterReconnectWindowExceeded asserts that once
+// ReconnectWindow has elapsed since the tunnel's last real activity, the
+// token is rejected - the grace period does not extend a session forever,
+// it just needs a reconnect attempt to actually arrive within the window
+// of the last time the tunnel was genuinely alive.
+func TestCheckPAACookieRejectsAfterReconnectWindowExceeded(t *testing.T) {
+	clock := setupReconnectTest(t, 5*time.Minute, 30*time.Minute)
+
+	issueCtx, _ := newCheckCtx("10.0.0.1")
+	token, err := GeneratePAAToken(issueCtx, "alice", "rdp.example.com")
+	if err != nil {
+		t.Fatalf("GeneratePAAToken: %v", err)
+	}
+
+	checkCtx, tun := newCheckCtx("10.0.0.1")
+	if ok, err := CheckPAACookie(checkCtx, token); err != nil || !ok {
+		t.Fatalf("first use should succeed: ok=%v err=%v", ok, err)
+	}
+	closeTunnel(tun, clock.now) // last activity is effectively "now"
+
+	clock.Advance(45 * time.Minute) // past ReconnectWindow since that last activity
+
+	checkCtx2, _ := newCheckCtx("10.0.0.1")
+	if ok, err := CheckPAACookie(checkCtx2, token); err == nil || ok {
+		t.Fatalf("token should be rejected once the reconnect window has elapsed since last activity: ok=%v err=%v", ok, err)
 	}
 }
 

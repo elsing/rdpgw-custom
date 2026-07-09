@@ -1,0 +1,710 @@
+diff --git a/README.md b/README.md
+index 01b9bea..d7ea695 100644
+--- a/README.md
++++ b/README.md
+@@ -252,6 +252,27 @@ Security:
+   # Verifies if the ip used to connect to download the rdp file equals from where the
+   # connection is opened.
+   VerifyClientIp: true
++  # How long (in minutes) the PAA token embedded in the downloaded .rdp file
++  # remains valid. The RDP client resends this same token every time it opens
++  # a tunnel to the gateway, including on reconnects after a brief network
++  # interruption - not just on the initial connect. If a reconnect happens
++  # after this many minutes have passed since the file was downloaded, it
++  # will be rejected even if the session itself is still within IdleTimeout.
++  # Raise this if you see reconnects failing after short network blips.
++  # Defaults to 5. Can also be set via the RDPGW_SECURITY__PAATOKENLIFETIME
++  # environment variable.
++  PAATokenLifetime: 5
++  # Additional grace period (in minutes) on top of PAATokenLifetime.
++  # A PAA token that has ALREADY been used to open a tunnel successfully
++  # at least once may be reused past its nominal expiry within this
++  # window - letting a client reconnect after a brief network blip
++  # without a fresh .rdp file. A token that is expired and was never
++  # used successfully (e.g. a stale or stolen, but never-used, .rdp
++  # file) is still rejected outright regardless of this setting.
++  # Defaults to 0 (disabled - strict expiry, previous behaviour); set to
++  # 0 to turn reconnects back off. Can also be set via the
++  # RDPGW_SECURITY__PAARECONNECTWINDOW environment variable.
++  PAAReconnectWindow: 30
+ ```
+ 
+ ## How to build & install
+diff --git a/cmd/rdpgw/config/configuration.go b/cmd/rdpgw/config/configuration.go
+index 4f2f962..224bb04 100644
+--- a/cmd/rdpgw/config/configuration.go
++++ b/cmd/rdpgw/config/configuration.go
+@@ -123,13 +123,13 @@ type OpenIDConfig struct {
+ }
+ 
+ type HeaderConfig struct {
+-	UserHeader      string `koanf:"userheader"`
+-	UserIdHeader    string `koanf:"useridheader"`
+-	EmailHeader     string `koanf:"emailheader"`
++	UserHeader        string `koanf:"userheader"`
++	UserIdHeader      string `koanf:"useridheader"`
++	EmailHeader       string `koanf:"emailheader"`
+ 	DisplayNameHeader string `koanf:"displaynameheader"`
+ 	// TrustedProxies is the CIDR allow-list of upstream proxies allowed to
+ 	// stamp UserHeader (and friends). Empty disables header auth at runtime.
+-	TrustedProxies  []string `koanf:"trustedproxies"`
++	TrustedProxies []string `koanf:"trustedproxies"`
+ }
+ 
+ type RDGCapsConfig struct {
+@@ -154,6 +154,22 @@ type SecurityConfig struct {
+ 	QueryTokenIssuer       string `koanf:"querytokenissuer"`
+ 	VerifyClientIp         bool   `koanf:"verifyclientip"`
+ 	EnableUserToken        bool   `koanf:"enableusertoken"`
++	// PAATokenLifetime is how long (in minutes) the PAA token embedded in
++	// the .rdp file is valid for. The client resends this token on every
++	// tunnel create, including reconnects after brief network drops, so
++	// values that are too short will cause reconnects to be rejected with
++	// E_PROXY_COOKIE_AUTHENTICATION_ACCESS_DENIED even though the session
++	// itself is still within IdleTimeout. Defaults to 5 minutes.
++	PAATokenLifetime int `koanf:"paatokenlifetime"`
++	// PAAReconnectWindow is an additional grace period (in minutes), on
++	// top of PAATokenLifetime, during which a PAA token that has ALREADY
++	// been used to open a tunnel successfully at least once may be reused
++	// past its nominal expiry - allowing a client to reconnect after a
++	// brief network interruption without a fresh .rdp file. A token that
++	// is expired and was never used successfully is still rejected
++	// outright. Zero (the default) disables this and preserves strict
++	// expiry behaviour.
++	PAAReconnectWindow int `koanf:"paareconnectwindow"`
+ }
+ 
+ type ClientConfig struct {
+@@ -223,6 +239,7 @@ func Load(configFile string) Configuration {
+ 		"Client.NetworkAutoDetect":   1,
+ 		"Client.BandwidthAutoDetect": 1,
+ 		"Security.VerifyClientIp":    true,
++		"Security.PAATokenLifetime":  5,
+ 		"Caps.TokenAuth":             true,
+ 	}, "."), nil)
+ 
+diff --git a/cmd/rdpgw/config/configuration_test.go b/cmd/rdpgw/config/configuration_test.go
+index 05d93b0..70dbb75 100644
+--- a/cmd/rdpgw/config/configuration_test.go
++++ b/cmd/rdpgw/config/configuration_test.go
+@@ -132,6 +132,51 @@ func contains(haystack, needle string) bool {
+ 	return false
+ }
+ 
++// TestPAAReconnectSettingsFromEnv asserts that PAATokenLifetime and
++// PAAReconnectWindow can be set via the standard RDPGW_<SECTION>__<FIELD>
++// environment variable convention (no config file needed), the same way
++// every other Configuration field already can - RDPGW_SECURITY__PAATOKENLIFETIME
++// and RDPGW_SECURITY__PAARECONNECTWINDOW respectively.
++func TestPAAReconnectSettingsFromEnv(t *testing.T) {
++	t.Setenv("RDPGW_SECURITY__PAATOKENLIFETIME", "15")
++	t.Setenv("RDPGW_SECURITY__PAARECONNECTWINDOW", "45")
++	// Load() needs signing/encryption keys of the right length or it will
++	// silently generate random ones; that's fine here, we only care about
++	// the two fields under test.
++	t.Setenv("RDPGW_SECURITY__PAATOKENSIGNINGKEY", "5aa3a1568fe8421cd7e127d5ace28d2d")
++	t.Setenv("RDPGW_SECURITY__PAATOKENENCRYPTIONKEY", "d3ecd7e565e56e37e2f2e95b584d8c0c")
++	t.Setenv("RDPGW_SERVER__SESSIONKEY", "0123456789abcdef0123456789abcdef")
++	t.Setenv("RDPGW_SERVER__SESSIONENCRYPTIONKEY", "fedcba9876543210fedcba9876543210")
++
++	c := Load("/nonexistent-rdpgw-config-for-test.yaml")
++
++	if c.Security.PAATokenLifetime != 15 {
++		t.Errorf("PAATokenLifetime = %d, want 15 (from RDPGW_SECURITY__PAATOKENLIFETIME)", c.Security.PAATokenLifetime)
++	}
++	if c.Security.PAAReconnectWindow != 45 {
++		t.Errorf("PAAReconnectWindow = %d, want 45 (from RDPGW_SECURITY__PAARECONNECTWINDOW)", c.Security.PAAReconnectWindow)
++	}
++}
++
++// TestPAAReconnectWindowDefaultsToDisabled asserts that with no env var or
++// config file entry, PAAReconnectWindow defaults to 0 (disabled) while
++// PAATokenLifetime still defaults to 5 - i.e. reconnects are opt-in.
++func TestPAAReconnectWindowDefaultsToDisabled(t *testing.T) {
++	t.Setenv("RDPGW_SECURITY__PAATOKENSIGNINGKEY", "5aa3a1568fe8421cd7e127d5ace28d2d")
++	t.Setenv("RDPGW_SECURITY__PAATOKENENCRYPTIONKEY", "d3ecd7e565e56e37e2f2e95b584d8c0c")
++	t.Setenv("RDPGW_SERVER__SESSIONKEY", "0123456789abcdef0123456789abcdef")
++	t.Setenv("RDPGW_SERVER__SESSIONENCRYPTIONKEY", "fedcba9876543210fedcba9876543210")
++
++	c := Load("/nonexistent-rdpgw-config-for-test.yaml")
++
++	if c.Security.PAAReconnectWindow != 0 {
++		t.Errorf("PAAReconnectWindow = %d, want 0 (disabled by default)", c.Security.PAAReconnectWindow)
++	}
++	if c.Security.PAATokenLifetime != 5 {
++		t.Errorf("PAATokenLifetime = %d, want 5 (default)", c.Security.PAATokenLifetime)
++	}
++}
++
+ func TestHeaderConfigValidation(t *testing.T) {
+ 	cases := []struct {
+ 		name        string
+@@ -165,4 +210,4 @@ func TestHeaderConfigValidation(t *testing.T) {
+ 			}
+ 		})
+ 	}
+-}
+\ No newline at end of file
++}
+diff --git a/cmd/rdpgw/main.go b/cmd/rdpgw/main.go
+index 6cef497..8c48dfa 100644
+--- a/cmd/rdpgw/main.go
++++ b/cmd/rdpgw/main.go
+@@ -9,6 +9,7 @@ import (
+ 	"net/url"
+ 	"os"
+ 	"strconv"
++	"time"
+ 
+ 	"github.com/bolkedebruin/gokrb5/v8/keytab"
+ 	"github.com/bolkedebruin/gokrb5/v8/service"
+@@ -86,6 +87,12 @@ func main() {
+ 
+ 	// set security options
+ 	security.VerifyClientIP = conf.Security.VerifyClientIp
++	if conf.Security.PAATokenLifetime > 0 {
++		security.ExpiryTime = time.Duration(conf.Security.PAATokenLifetime) * time.Minute
++	}
++	if conf.Security.PAAReconnectWindow > 0 {
++		security.ReconnectWindow = time.Duration(conf.Security.PAAReconnectWindow) * time.Minute
++	}
+ 	security.SigningKey = []byte(conf.Security.PAATokenSigningKey)
+ 	security.EncryptionKey = []byte(conf.Security.PAATokenEncryptionKey)
+ 	security.UserEncryptionKey = []byte(conf.Security.UserTokenEncryptionKey)
+@@ -203,6 +210,7 @@ func main() {
+ 	if conf.Caps.TokenAuth {
+ 		gw.CheckPAACookie = security.CheckPAACookie
+ 		gw.CheckHost = security.CheckSession(security.CheckHost)
++		protocol.OnTunnelClosed = security.RecordTunnelClosed
+ 	} else {
+ 		gw.CheckHost = security.CheckHost
+ 	}
+diff --git a/cmd/rdpgw/protocol/track.go b/cmd/rdpgw/protocol/track.go
+index 0d38d43..515fd48 100644
+--- a/cmd/rdpgw/protocol/track.go
++++ b/cmd/rdpgw/protocol/track.go
+@@ -3,13 +3,24 @@ package protocol
+ import (
+ 	"fmt"
+ 	"sync"
++	"time"
+ )
+ 
+ var (
+-	Connections        = map[string]*Monitor{}
+-	connectionsMu      sync.RWMutex
++	Connections   = map[string]*Monitor{}
++	connectionsMu sync.RWMutex
+ )
+ 
++// OnTunnelClosed, if set, is called by RemoveTunnel right before a tunnel
++// is dropped from the registry, with that tunnel's final state (including
++// LastSeen - the last time real data was read from the client). It exists
++// so other packages can observe a tunnel's true last-activity time at the
++// moment it closes, without protocol importing them - they already import
++// protocol, so the reverse would be a cycle. This is the same
++// dependency-injection pattern Gateway.CheckPAACookie / Gateway.CheckHost
++// already use.
++var OnTunnelClosed func(t *Tunnel)
++
+ type Monitor struct {
+ 	Processor *Processor
+ 	Tunnel    *Tunnel
+@@ -31,9 +42,34 @@ func RegisterTunnel(t *Tunnel, p *Processor) {
+ 
+ func RemoveTunnel(t *Tunnel) {
+ 	connectionsMu.Lock()
+-	defer connectionsMu.Unlock()
+-
+ 	delete(Connections, t.Id)
++	connectionsMu.Unlock()
++
++	if OnTunnelClosed != nil {
++		OnTunnelClosed(t)
++	}
++}
++
++// TunnelLastSeenByHash returns the LastSeen time of a currently still-open
++// tunnel authenticated by the PAA token whose hash is given, if one
++// exists. This covers the rare case where a reconnect attempt races an old
++// tunnel that hasn't finished tearing down yet; the common case (the old
++// tunnel already closed) is covered by OnTunnelClosed instead. This does a
++// linear scan of currently open tunnels, which is fine at the connection
++// counts a gateway like this typically handles, but is worth knowing about
++// if that assumption changes.
++func TunnelLastSeenByHash(hash string) (time.Time, bool) {
++	if hash == "" {
++		return time.Time{}, false
++	}
++	connectionsMu.RLock()
++	defer connectionsMu.RUnlock()
++	for _, m := range Connections {
++		if m.Tunnel.PAATokenHash == hash {
++			return m.Tunnel.LastSeen, true
++		}
++	}
++	return time.Time{}, false
+ }
+ 
+ func Disconnect(id string) error {
+diff --git a/cmd/rdpgw/protocol/track_test.go b/cmd/rdpgw/protocol/track_test.go
+index 6ac1d47..17c49a5 100644
+--- a/cmd/rdpgw/protocol/track_test.go
++++ b/cmd/rdpgw/protocol/track_test.go
+@@ -45,7 +45,71 @@ func TestTunnelTrackerConcurrent(t *testing.T) {
+ 	wg.Wait()
+ }
+ 
+-// TestDisconnectKnownConnection verifies that Disconnect signals the
++// TestRemoveTunnelFiresOnTunnelClosed verifies RemoveTunnel invokes
++// OnTunnelClosed with the tunnel being removed, and that it's safe to
++// leave OnTunnelClosed unset (the common case for anything that doesn't
++// care, and the default in every other test in this file).
++func TestRemoveTunnelFiresOnTunnelClosed(t *testing.T) {
++	resetConnections()
++	t.Cleanup(resetConnections)
++	t.Cleanup(func() { OnTunnelClosed = nil })
++
++	var got *Tunnel
++	OnTunnelClosed = func(t *Tunnel) { got = t }
++
++	tun := &Tunnel{Id: "tun-hook-test", PAATokenHash: "deadbeef"}
++	RegisterTunnel(tun, &Processor{ctl: make(chan int)})
++	RemoveTunnel(tun)
++
++	if got != tun {
++		t.Fatalf("OnTunnelClosed was not called with the removed tunnel")
++	}
++}
++
++// TestRemoveTunnelWithoutHookDoesNotPanic verifies RemoveTunnel is safe to
++// call when OnTunnelClosed is nil (its zero value).
++func TestRemoveTunnelWithoutHookDoesNotPanic(t *testing.T) {
++	resetConnections()
++	t.Cleanup(resetConnections)
++	OnTunnelClosed = nil
++
++	defer func() {
++		if r := recover(); r != nil {
++			t.Errorf("RemoveTunnel panicked with OnTunnelClosed unset: %v", r)
++		}
++	}()
++	tun := &Tunnel{Id: "tun-no-hook"}
++	RegisterTunnel(tun, &Processor{ctl: make(chan int)})
++	RemoveTunnel(tun)
++}
++
++// TestTunnelLastSeenByHash verifies the still-open-tunnel lookup used for
++// the rare case where a reconnect races an old tunnel that hasn't finished
++// tearing down yet.
++func TestTunnelLastSeenByHash(t *testing.T) {
++	resetConnections()
++	t.Cleanup(resetConnections)
++
++	if _, found := TunnelLastSeenByHash("no-such-hash"); found {
++		t.Error("TunnelLastSeenByHash found a match for a hash that was never registered")
++	}
++	if _, found := TunnelLastSeenByHash(""); found {
++		t.Error("TunnelLastSeenByHash should never match on an empty hash")
++	}
++
++	seen := time.Now()
++	tun := &Tunnel{Id: "tun-open", PAATokenHash: "abc123", LastSeen: seen}
++	RegisterTunnel(tun, &Processor{ctl: make(chan int)})
++
++	got, found := TunnelLastSeenByHash("abc123")
++	if !found {
++		t.Fatal("TunnelLastSeenByHash did not find a currently open tunnel by its token hash")
++	}
++	if !got.Equal(seen) {
++		t.Errorf("TunnelLastSeenByHash returned %v, want %v", got, seen)
++	}
++}
++
+ // processor for a connection that exists in the registry.
+ func TestDisconnectKnownConnection(t *testing.T) {
+ 	resetConnections()
+diff --git a/cmd/rdpgw/protocol/tunnel.go b/cmd/rdpgw/protocol/tunnel.go
+index 0f4a350..362fc35 100644
+--- a/cmd/rdpgw/protocol/tunnel.go
++++ b/cmd/rdpgw/protocol/tunnel.go
+@@ -30,6 +30,14 @@ type Tunnel struct {
+ 	// User
+ 	User identity.Identity
+ 
++	// PAATokenHash is the SHA-256 hash (hex-encoded) of the PAA token that
++	// authenticated this tunnel, set once the token has been validated.
++	// Kept as a hash, not the raw token, so nothing else has to retain
++	// bearer-token-equivalent material for the tunnel's whole lifetime.
++	// Empty until set. Used purely for reconnect-window bookkeeping (see
++	// the security package); the gateway itself never reads it.
++	PAATokenHash string
++
+ 	// rwc is the underlying connection to the remote desktop server.
+ 	// It is of the type *net.TCPConn
+ 	rwc net.Conn
+diff --git a/cmd/rdpgw/security/jwt.go b/cmd/rdpgw/security/jwt.go
+index 7752bf8..75276df 100644
+--- a/cmd/rdpgw/security/jwt.go
++++ b/cmd/rdpgw/security/jwt.go
+@@ -2,6 +2,8 @@ package security
+ 
+ import (
+ 	"context"
++	"crypto/sha256"
++	"encoding/hex"
+ 	"errors"
+ 	"fmt"
+ 	"log"
+@@ -12,6 +14,7 @@ import (
+ 	"github.com/coreos/go-oidc/v3/oidc"
+ 	"github.com/go-jose/go-jose/v4"
+ 	"github.com/go-jose/go-jose/v4/jwt"
++	"github.com/patrickmn/go-cache"
+ 	"golang.org/x/oauth2"
+ )
+ 
+@@ -27,9 +30,66 @@ var (
+ 	Oauth2Config      oauth2.Config
+ )
+ 
+-var ExpiryTime time.Duration = 5
++// ExpiryTime is how long the PAA token embedded in the .rdp file remains
++// valid. The client resends this same token on every tunnel create,
++// including reconnects after a brief network interruption, so it must be
++// long enough to cover expected reconnect gaps. Configurable via
++// security.paatokenlifetime (minutes). Defaults to 5 minutes.
++var ExpiryTime time.Duration = 5 * time.Minute
++
++// ReconnectWindow is a grace period, on top of ExpiryTime, during which a
++// PAA token that has ALREADY been used to successfully open a tunnel at
++// least once may be reused again even after its nominal expiry. This lets
++// a client reconnect after a brief network interruption without needing a
++// fresh .rdp file, while a token that is expired and was never used
++// successfully (e.g. a stale, unused, or stolen .rdp file) is still
++// rejected outright - it never entered the reconnect cache in the first
++// place. Configurable via security.paareconnectwindow (minutes). Zero
++// (the default) disables this and preserves the old strict-expiry
++// behaviour.
++var ReconnectWindow time.Duration = 0
++
++// closedTunnelActivity tracks, per PAA-token hash, the last real activity
++// (Tunnel.LastSeen) recorded when a tunnel authenticated by that token
++// closed. It is populated by RecordTunnelClosed - wired to
++// protocol.OnTunnelClosed in main.go - which fires at the moment a tunnel
++// tears down, not on any timer. CheckPAACookie consults this (plus
++// protocol.TunnelLastSeenByHash for the rarer still-open case) when a
++// token is presented past its nominal expiry, so the reconnect grace
++// window is anchored to how recently the session was genuinely alive,
++// not to how recently a reconnect happened to occur. This matters: a
++// session that ran healthily for an hour with zero reconnects should get
++// the same grace on a blip as one that just reconnected a minute ago -
++// anchoring to "last reconnect" instead would unfairly penalise the
++// stable session. Only written/read when ReconnectWindow > 0. The go-cache
++// TTL on each entry is set to ExpiryTime+ReconnectWindow at write time so
++// stale entries are swept automatically.
++var closedTunnelActivity = cache.New(5*time.Minute, 10*time.Minute)
++
+ var VerifyClientIP bool = true
+ 
++// hashToken returns a hex-encoded SHA-256 hash of a PAA token. Tunnels
++// remember which token authenticated them by this hash (Tunnel.PAATokenHash)
++// rather than the raw token, so reconnect-window bookkeeping doesn't keep a
++// second, longer-lived copy of bearer-token-equivalent material around.
++func hashToken(tokenString string) string {
++	sum := sha256.Sum256([]byte(tokenString))
++	return hex.EncodeToString(sum[:])
++}
++
++// RecordTunnelClosed is wired to protocol.OnTunnelClosed (see main.go). It
++// fires exactly once, at the moment a tunnel tears down, and remembers
++// that tunnel's last real activity against the PAA token that
++// authenticated it - the signal CheckPAACookie later uses to judge whether
++// a reconnect with the same, by-then-expired token is still within the
++// reconnect grace window.
++func RecordTunnelClosed(t *protocol.Tunnel) {
++	if ReconnectWindow <= 0 || t == nil || t.PAATokenHash == "" {
++		return
++	}
++	closedTunnelActivity.Set(t.PAATokenHash, t.LastSeen, ExpiryTime+ReconnectWindow)
++}
++
+ type customClaims struct {
+ 	RemoteServer string `json:"remoteServer"`
+ 	ClientIP     string `json:"clientIp"`
+@@ -87,16 +147,71 @@ func CheckPAACookie(ctx context.Context, tokenString string) (bool, error) {
+ 		return false, err
+ 	}
+ 
+-	// ...but doesn't check the expiry claim :/
+-	err = standard.Validate(jwt.Expected{
+-		Issuer:      "rdpgw",
+-		AnyAudience: jwt.Audience{paaAudience},
+-		Time:        time.Now(),
+-	})
++	// Check issuer/audience ourselves rather than via standard.Validate, so
++	// that a token past its nominal expiry can still be considered for the
++	// reconnect grace window below instead of being hard-rejected here.
++	// (go-jose's Validate always checks expiry against time.Now() unless
++	// told otherwise - there is no zero-value way to ask it to skip that
++	// check - so we don't use it for the time dimension at all.)
++	if standard.Issuer != "rdpgw" {
++		log.Printf("token validation failed: unexpected issuer %q", standard.Issuer)
++		return false, errors.New("invalid issuer")
++	}
++	validAudience := false
++	for _, aud := range standard.Audience {
++		if aud == paaAudience {
++			validAudience = true
++			break
++		}
++	}
++	if !validAudience {
++		log.Printf("token validation failed: unexpected audience %v", standard.Audience)
++		return false, errors.New("invalid audience")
++	}
+ 
+-	if err != nil {
+-		log.Printf("token validation failed due to %s", err)
+-		return false, err
++	var hash string
++	if ReconnectWindow > 0 {
++		hash = hashToken(tokenString)
++	}
++
++	now := time.Now()
++	if standard.Expiry != nil && now.After(standard.Expiry.Time()) {
++		// Token is past its nominal expiry. Only acceptable if reconnects
++		// are enabled AND we can find real evidence this token previously
++		// authenticated an active tunnel, within the reconnect window of
++		// that tunnel's last known activity. This means a stale/unused
++		// .rdp file is rejected exactly as before - it can only get here
++		// if it was already actively used.
++		if ReconnectWindow <= 0 {
++			log.Printf("PAA token for %s expired at %s and reconnects are disabled",
++				standard.Subject, standard.Expiry.Time())
++			return false, errors.New("token expired")
++		}
++
++		// Prefer a still-open tunnel's live LastSeen - covers the rare
++		// case where a reconnect races an old tunnel that hasn't finished
++		// tearing down yet. Otherwise fall back to what was recorded when
++		// a matching tunnel last closed.
++		lastActivity, found := protocol.TunnelLastSeenByHash(hash)
++		if !found {
++			if v, ok := closedTunnelActivity.Get(hash); ok {
++				lastActivity, found = v.(time.Time), true
++			}
++		}
++
++		if !found {
++			log.Printf("PAA token for %s expired at %s and was never seen used before; rejecting",
++				standard.Subject, standard.Expiry.Time())
++			return false, errors.New("token expired")
++		}
++		if now.Sub(lastActivity) > ReconnectWindow {
++			log.Printf("PAA token for %s expired at %s; last real activity was %s ago, past the %s reconnect window",
++				standard.Subject, standard.Expiry.Time(), now.Sub(lastActivity), ReconnectWindow)
++			closedTunnelActivity.Delete(hash)
++			return false, errors.New("reconnect window exceeded")
++		}
++		log.Printf("PAA token for %s expired at %s but last real activity was only %s ago; allowing reconnect",
++			standard.Subject, standard.Expiry.Time(), now.Sub(lastActivity))
+ 	}
+ 
+ 	tunnel := getTunnel(ctx)
+@@ -104,6 +219,10 @@ func CheckPAACookie(ctx context.Context, tokenString string) (bool, error) {
+ 		return false, errors.New("no tunnel in context")
+ 	}
+ 
++	if ReconnectWindow > 0 {
++		tunnel.PAATokenHash = hash
++	}
++
+ 	tunnel.TargetServer = custom.RemoteServer
+ 	tunnel.RemoteAddr = custom.ClientIP
+ 	tunnel.User.SetUserName(standard.Subject)
+@@ -124,7 +243,7 @@ func GeneratePAAToken(ctx context.Context, username string, server string) (stri
+ 	standard := jwt.Claims{
+ 		Issuer:   "rdpgw",
+ 		Audience: jwt.Audience{paaAudience},
+-		Expiry:   jwt.NewNumericDate(time.Now().Add(time.Minute * 5)),
++		Expiry:   jwt.NewNumericDate(time.Now().Add(ExpiryTime)),
+ 		Subject:  username,
+ 	}
+ 
+diff --git a/cmd/rdpgw/security/jwt_test.go b/cmd/rdpgw/security/jwt_test.go
+index 8a764c4..63a9e4c 100644
+--- a/cmd/rdpgw/security/jwt_test.go
++++ b/cmd/rdpgw/security/jwt_test.go
+@@ -145,6 +145,170 @@ func TestPAACookieHasAudienceClaim(t *testing.T) {
+ 	}
+ }
+ 
++// newCheckCtx builds a context for CheckPAACookie the same way
++// TestCheckPAACookieIsSelfContained does: a fresh identity/tunnel pair
++// scoped to the given client IP, with VerifyClientIP left as the caller
++// set it.
++func newCheckCtx(clientIp string) (context.Context, *protocol.Tunnel) {
++	id := identity.NewUser()
++	id.SetUserName("alice")
++	id.SetAttribute(identity.AttrClientIp, clientIp)
++	ctx := context.WithValue(context.Background(), identity.CTXKey, id)
++	tun := &protocol.Tunnel{User: id}
++	ctx = context.WithValue(ctx, protocol.CtxTunnel, tun)
++	return ctx, tun
++}
++
++// closeTunnel simulates a tunnel tearing down: sets LastSeen to mark when
++// it was last genuinely active (real code does this on every Read(); tests
++// set it directly), then fires the same hook RemoveTunnel fires in the
++// real gateway.
++func closeTunnel(tun *protocol.Tunnel, lastSeen time.Time) {
++	tun.LastSeen = lastSeen
++	RecordTunnelClosed(tun)
++}
++
++// TestCheckPAACookieReconnectWindowDisabledByDefault asserts the previous,
++// strict behaviour is unchanged when PAAReconnectWindow is left at its
++// zero-value default: an expired token is rejected outright, even if the
++// tunnel it authenticated was active right up until it closed.
++func TestCheckPAACookieReconnectWindowDisabledByDefault(t *testing.T) {
++	SigningKey = []byte("5aa3a1568fe8421cd7e127d5ace28d2d")
++	VerifyClientIP = false
++	ExpiryTime = 20 * time.Millisecond
++	ReconnectWindow = 0
++	closedTunnelActivity.Flush()
++
++	issueCtx, _ := newCheckCtx("10.0.0.1")
++	token, err := GeneratePAAToken(issueCtx, "alice", "rdp.example.com")
++	if err != nil {
++		t.Fatalf("GeneratePAAToken: %v", err)
++	}
++
++	checkCtx, tun := newCheckCtx("10.0.0.1")
++	if ok, err := CheckPAACookie(checkCtx, token); err != nil || !ok {
++		t.Fatalf("first use should succeed: ok=%v err=%v", ok, err)
++	}
++	closeTunnel(tun, time.Now()) // active right up to close
++
++	time.Sleep(30 * time.Millisecond) // past ExpiryTime
++
++	checkCtx2, _ := newCheckCtx("10.0.0.1")
++	if ok, err := CheckPAACookie(checkCtx2, token); err == nil || ok {
++		t.Fatalf("expired token should be rejected when ReconnectWindow=0: ok=%v err=%v", ok, err)
++	}
++}
++
++// TestCheckPAACookieReconnectAfterLongStableSession is the scenario this
++// feature exists for: a session that ran healthily for a long time (no
++// reconnects at all, so nothing ever touched CheckPAACookie again after
++// the first connect) blips right at the end. The reconnect window must be
++// judged against how recently the tunnel was genuinely active when it
++// closed, not against how long ago the original connect happened -
++// otherwise a long, healthy session would be *less* protected than a
++// flaky one that kept reconnecting.
++func TestCheckPAACookieReconnectAfterLongStableSession(t *testing.T) {
++	SigningKey = []byte("5aa3a1568fe8421cd7e127d5ace28d2d")
++	VerifyClientIP = false
++	ExpiryTime = 5 * time.Millisecond
++	ReconnectWindow = 50 * time.Millisecond
++	closedTunnelActivity.Flush()
++
++	issueCtx, _ := newCheckCtx("10.0.0.1")
++	token, err := GeneratePAAToken(issueCtx, "alice", "rdp.example.com")
++	if err != nil {
++		t.Fatalf("GeneratePAAToken: %v", err)
++	}
++
++	checkCtx, tun := newCheckCtx("10.0.0.1")
++	if ok, err := CheckPAACookie(checkCtx, token); err != nil || !ok {
++		t.Fatalf("first use should succeed: ok=%v err=%v", ok, err)
++	}
++
++	// The tunnel stays open and genuinely active for well longer than
++	// ExpiryTime, exactly as a long, stable RDP session would - nobody
++	// calls CheckPAACookie again during this stretch because no new
++	// tunnel is being created; the client is just talking to the one it
++	// already has.
++	time.Sleep(40 * time.Millisecond)
++
++	// The blip finally happens: the tunnel closes now, with LastSeen
++	// reflecting that it was genuinely active right up to this moment -
++	// not the original connect time from 40ms ago.
++	closeTunnel(tun, time.Now())
++
++	// Reconnect arrives shortly after that true last activity - well
++	// within ReconnectWindow of it - even though it's long past
++	// ExpiryTime (8x it) and long past the original connect.
++	checkCtx2, tun2 := newCheckCtx("10.0.0.1")
++	ok, err := CheckPAACookie(checkCtx2, token)
++	if err != nil || !ok {
++		t.Fatalf("reconnect shortly after a long stable session should succeed: ok=%v err=%v", ok, err)
++	}
++	if tun2.User.UserName() != "alice" {
++		t.Fatalf("tunnel.User = %q, want %q", tun2.User.UserName(), "alice")
++	}
++}
++
++// TestCheckPAACookieRejectsNeverUsedExpiredToken asserts that a stale
++// token that was never successfully used before is rejected outright, even
++// with a reconnect window configured. This is the security property that
++// makes the reconnect window safe to enable: it only extends tokens that
++// have already proven themselves against a real, observed tunnel, not any
++// expired token that shows up.
++func TestCheckPAACookieRejectsNeverUsedExpiredToken(t *testing.T) {
++	SigningKey = []byte("5aa3a1568fe8421cd7e127d5ace28d2d")
++	VerifyClientIP = false
++	ExpiryTime = 20 * time.Millisecond
++	ReconnectWindow = 200 * time.Millisecond
++	closedTunnelActivity.Flush()
++
++	issueCtx, _ := newCheckCtx("10.0.0.1")
++	token, err := GeneratePAAToken(issueCtx, "alice", "rdp.example.com")
++	if err != nil {
++		t.Fatalf("GeneratePAAToken: %v", err)
++	}
++
++	time.Sleep(30 * time.Millisecond) // let it expire without ever being used
++
++	checkCtx, _ := newCheckCtx("10.0.0.1")
++	if ok, err := CheckPAACookie(checkCtx, token); err == nil || ok {
++		t.Fatalf("never-used expired token should be rejected: ok=%v err=%v", ok, err)
++	}
++}
++
++// TestCheckPAACookieRejectsAfterReconnectWindowExceeded asserts that once
++// ReconnectWindow has elapsed since the tunnel's last real activity, the
++// token is rejected - the grace period does not extend a session forever,
++// it just needs a reconnect attempt to actually arrive within the window
++// of the last time the tunnel was genuinely alive.
++func TestCheckPAACookieRejectsAfterReconnectWindowExceeded(t *testing.T) {
++	SigningKey = []byte("5aa3a1568fe8421cd7e127d5ace28d2d")
++	VerifyClientIP = false
++	ExpiryTime = 20 * time.Millisecond
++	ReconnectWindow = 30 * time.Millisecond
++	closedTunnelActivity.Flush()
++
++	issueCtx, _ := newCheckCtx("10.0.0.1")
++	token, err := GeneratePAAToken(issueCtx, "alice", "rdp.example.com")
++	if err != nil {
++		t.Fatalf("GeneratePAAToken: %v", err)
++	}
++
++	checkCtx, tun := newCheckCtx("10.0.0.1")
++	if ok, err := CheckPAACookie(checkCtx, token); err != nil || !ok {
++		t.Fatalf("first use should succeed: ok=%v err=%v", ok, err)
++	}
++	closeTunnel(tun, time.Now()) // last activity is effectively "now"
++
++	time.Sleep(60 * time.Millisecond) // past ReconnectWindow since that last activity
++
++	checkCtx2, _ := newCheckCtx("10.0.0.1")
++	if ok, err := CheckPAACookie(checkCtx2, token); err == nil || ok {
++		t.Fatalf("token should be rejected once the reconnect window has elapsed since last activity: ok=%v err=%v", ok, err)
++	}
++}
++
+ // TestCheckPAACookieIsSelfContained asserts that validating a PAA cookie
+ // does not require a live IdP. Today CheckPAACookie calls
+ // OIDCProvider.UserInfo with the embedded access token to look up the

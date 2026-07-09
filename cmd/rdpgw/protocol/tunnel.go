@@ -30,6 +30,14 @@ type Tunnel struct {
 	// User
 	User identity.Identity
 
+	// PAATokenHash is the SHA-256 hash (hex-encoded) of the PAA token that
+	// authenticated this tunnel, set once the token has been validated.
+	// Kept as a hash, not the raw token, so nothing else has to retain
+	// bearer-token-equivalent material for the tunnel's whole lifetime.
+	// Empty until set. Used purely for reconnect-window bookkeeping (see
+	// the security package); the gateway itself never reads it.
+	PAATokenHash string
+
 	// rwc is the underlying connection to the remote desktop server.
 	// It is of the type *net.TCPConn
 	rwc net.Conn

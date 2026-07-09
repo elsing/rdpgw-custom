@@ -45,7 +45,71 @@ func TestTunnelTrackerConcurrent(t *testing.T) {
 	wg.Wait()
 }
 
-// TestDisconnectKnownConnection verifies that Disconnect signals the
+// TestRemoveTunnelFiresOnTunnelClosed verifies RemoveTunnel invokes
+// OnTunnelClosed with the tunnel being removed, and that it's safe to
+// leave OnTunnelClosed unset (the common case for anything that doesn't
+// care, and the default in every other test in this file).
+func TestRemoveTunnelFiresOnTunnelClosed(t *testing.T) {
+	resetConnections()
+	t.Cleanup(resetConnections)
+	t.Cleanup(func() { OnTunnelClosed = nil })
+
+	var got *Tunnel
+	OnTunnelClosed = func(t *Tunnel) { got = t }
+
+	tun := &Tunnel{Id: "tun-hook-test", PAATokenHash: "deadbeef"}
+	RegisterTunnel(tun, &Processor{ctl: make(chan int)})
+	RemoveTunnel(tun)
+
+	if got != tun {
+		t.Fatalf("OnTunnelClosed was not called with the removed tunnel")
+	}
+}
+
+// TestRemoveTunnelWithoutHookDoesNotPanic verifies RemoveTunnel is safe to
+// call when OnTunnelClosed is nil (its zero value).
+func TestRemoveTunnelWithoutHookDoesNotPanic(t *testing.T) {
+	resetConnections()
+	t.Cleanup(resetConnections)
+	OnTunnelClosed = nil
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Errorf("RemoveTunnel panicked with OnTunnelClosed unset: %v", r)
+		}
+	}()
+	tun := &Tunnel{Id: "tun-no-hook"}
+	RegisterTunnel(tun, &Processor{ctl: make(chan int)})
+	RemoveTunnel(tun)
+}
+
+// TestTunnelLastSeenByHash verifies the still-open-tunnel lookup used for
+// the rare case where a reconnect races an old tunnel that hasn't finished
+// tearing down yet.
+func TestTunnelLastSeenByHash(t *testing.T) {
+	resetConnections()
+	t.Cleanup(resetConnections)
+
+	if _, found := TunnelLastSeenByHash("no-such-hash"); found {
+		t.Error("TunnelLastSeenByHash found a match for a hash that was never registered")
+	}
+	if _, found := TunnelLastSeenByHash(""); found {
+		t.Error("TunnelLastSeenByHash should never match on an empty hash")
+	}
+
+	seen := time.Now()
+	tun := &Tunnel{Id: "tun-open", PAATokenHash: "abc123", LastSeen: seen}
+	RegisterTunnel(tun, &Processor{ctl: make(chan int)})
+
+	got, found := TunnelLastSeenByHash("abc123")
+	if !found {
+		t.Fatal("TunnelLastSeenByHash did not find a currently open tunnel by its token hash")
+	}
+	if !got.Equal(seen) {
+		t.Errorf("TunnelLastSeenByHash returned %v, want %v", got, seen)
+	}
+}
+
 // processor for a connection that exists in the registry.
 func TestDisconnectKnownConnection(t *testing.T) {
 	resetConnections()
